@@ -1,0 +1,105 @@
+Code:
+import asyncio
+import logging
+import os
+import gzip
+import json
+import base64
+from pathlib import Path
+from io import BytesIO
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from PIL import Image
+
+# Библиотеки для работы с Lottie
+from lottie.composition import Animation
+from lottie.layers import ImageLayer
+from lottie.exporters.tgs import export_tgs
+
+# Токен
+API_TOKEN = 'ВАШ_ТОКЕН_ЗДЕСЬ'
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
+
+BASE_DIR = Path(__file__).parent
+TEMP_DIR = BASE_DIR / "temp"
+TEMP_DIR.mkdir(exist_ok=True)
+
+def create_tgs_animation(source_image_path, output_tgs_path):
+    """Создает анимированный TGS (пульсация) из картинки"""
+    
+    # 1. Готовим изображение (обязательно 100x100 для эмодзи)
+    with Image.open(source_image_path) as img:
+        img = img.convert("RGBA")
+        img.thumbnail((100, 100))
+        final_img = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+        final_img.paste(img, ((100 - img.width) // 2, (100 - img.height) // 2))
+        
+        # Сохраняем в байты для вставки в Lottie
+        buffered = BytesIO()
+        final_img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+
+    # 2. Создаем Lottie анимацию (60 кадров = 1 сек)
+    anim = Animation(60)
+    anim.width = 100
+    anim.height = 100
+    
+    # Добавляем слой изображения
+    layer = anim.add_layer(ImageLayer())
+    layer.image.data = img_str
+    layer.image.is_extra = False
+    
+    # Центрируем слой
+    layer.transform.position.value.x = 50
+    layer.transform.position.value.y = 50
+
+    # 3. Добавляем простую анимацию (Пульсация масштаба)
+    # 0 сек - 100%, 0.5 сек - 110%, 1 сек - 100%
+    layer.transform.scale.add_keyframe(0, [100, 100])
+    layer.transform.scale.add_keyframe(30, [110, 110])
+    layer.transform.scale.add_keyframe(60, [100, 100])
+
+    # 4. Экспорт в .tgs (сжатие gzip внутри функции)
+    export_tgs(anim, str(output_tgs_path))
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Пришли мне фото, и я превращу его в анимированный .tgs эмодзи!")
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    photo = message.photo[-1]
+    input_path = TEMP_DIR / f"{photo.file_id}.png"
+    output_tgs = TEMP_DIR / f"{photo.file_id}.tgs"
+
+    await bot.download_file((await bot.get_file(photo.file_id)).file_path, str(input_path))
+
+    msg = await message.answer("⏳ Создаю анимацию .tgs...")
+
+    try:
+        # Запускаем тяжелую задачу в отдельном потоке, чтобы не вешать бота
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, create_tgs_animation, input_path, output_tgs)
+
+        # Отправляем файл
+        await message.answer_document(
+            types.FSInputFile(str(output_tgs)),
+            caption="Твой анимированный эмодзи готов!"
+        )
+    except Exception as e:
+        logging.error(e)
+        await message.answer("Ошибка при создании TGS.")
+    finally:
+        await msg.delete()
+        if input_path.exists(): os.remove(input_path)
+        if output_tgs.exists(): os.remove(output_tgs)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
